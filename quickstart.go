@@ -6,12 +6,14 @@ import (
 
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
 	"path"
 	"path/filepath"
 	"regexp"
+	"time"
 )
 
 // Settings for authorization.
@@ -32,6 +34,8 @@ var flag_file_pattern = flag.String("file_pattern", "", "A file name pattern to 
 
 var flag_drive_file = flag.String("drive_file", "", "A Google Drive file path.")
 var flag_drive_dir = flag.String("drive_dir", "", "A Google Drive directory path.")
+
+var flag_log_file = flag.String("log_file", "", "A log file.")
 
 func Usage() {
 	// TODO describe the usage.
@@ -82,7 +86,7 @@ func InsertFile(svc *drive.Service, localPath, driveParentId, driveFileName stri
 	if err != nil {
 		log.Fatalf("An error occurred uploading the document: %v\n", err)
 	}
-	log.Printf("Created: ID=%v, Title=%v\n", r.Id, r.Title)
+	log.Printf("Created: ID=%v, Title=%v, Size=%dB (%dMB)\n", r.Id, r.Title, r.FileSize, (r.FileSize+512)/1024/1024)
 }
 
 func SearchForSubdir(svc *drive.Service, parentFolderId, title string) (*drive.ChildReference, error) {
@@ -117,6 +121,71 @@ func SearchForSubdir(svc *drive.Service, parentFolderId, title string) (*drive.C
 		return nil, nil
 	}
 	return fs[0], nil
+}
+
+func AllFilesInDir2(svc *drive.Service, parentFolderId string) ([]*drive.ChildReference, error) {
+	var fs []*drive.ChildReference
+	pageToken := ""
+	for {
+		q := svc.Children.List(parentFolderId)
+		// If we have a pageToken set, apply it to the query
+		if pageToken != "" {
+			q = q.PageToken(pageToken)
+		}
+		r, err := q.Do()
+		if err != nil {
+			log.Fatalf("Error when searching for dir: %v\n", err)
+			return nil, err
+		}
+		fs = append(fs, r.Items...)
+		pageToken = r.NextPageToken
+		if pageToken == "" {
+			break
+		}
+	}
+
+	// fetch metadata for each fs
+	return fs, nil
+}
+
+func GetMetadatas(svc *drive.Service, children []*drive.ChildReference) ([]*drive.File, error) {
+	var fs []*drive.File
+	for _, child := range children {
+		f, err := svc.Files.Get(child.Id).Do()
+		if err != nil {
+			log.Printf("An error occurred: %v\n", err)
+			continue
+		}
+		fs = append(fs, f)
+	}
+	return fs, nil
+}
+
+// AllFiles fetches and displays all files
+func AllFilesInDir(d *drive.Service, parentFolderId string) ([]*drive.File, error) {
+	var fs []*drive.File
+	pageToken := ""
+	for {
+		q := d.Files.List()
+		// If we have a pageToken set, apply it to the query
+		if pageToken != "" {
+			q = q.PageToken(pageToken)
+		}
+		if parentFolderId != "" {
+			q = q.Q(fmt.Sprintf("'%s' in parents", parentFolderId))
+		}
+		r, err := q.Do()
+		if err != nil {
+			fmt.Printf("An error occurred: %v\n", err)
+			return fs, err
+		}
+		fs = append(fs, r.Items...)
+		pageToken = r.NextPageToken
+		if pageToken == "" {
+			break
+		}
+	}
+	return fs, nil
 }
 
 func MakeSubdir(svc *drive.Service, parentFolderId, title string) (*drive.File, error) {
@@ -240,13 +309,58 @@ func CreatePrintFunc() filepath.WalkFunc {
 func CreateUploadFunc(svc *drive.Service, parentFolderId string) filepath.WalkFunc {
 	return func(path string, info os.FileInfo, err error) error {
 		log.Printf("Path to upload %s", path)
+		InsertFile(svc, path, parentFolderId, info.Name())
 		return nil
 	}
+}
+
+func BenchmarkGetAllFiles(svc *drive.Service) {
+	photosDir := "0BzlEOKvvsS8la2hxSnA0cVRnOW8"
+	t0 := time.Now()
+	_, err := AllFilesInDir(svc, photosDir)
+	t1 := time.Now()
+	if err != nil {
+		log.Printf("Error: %v", err)
+	}
+	log.Printf("AllFilesInDir(): %v", t1.Sub(t0))
+	t2 := time.Now()
+	children, err := AllFilesInDir2(svc, photosDir)
+	_, err = GetMetadatas(svc, children)
+	t3 := time.Now()
+	if err != nil {
+		log.Printf("Error: %v", err)
+	}
+	log.Printf("AllFilesInDir2(): %v", t3.Sub(t2))
+
+	// Result for 273 elements in directory
+	// 2014/08/14 23:18:40 AllFilesInDir(): 6.331292724s
+	// 2014/08/14 23:20:14 AllFilesInDir2(): 1m33.916649055s
+}
+
+func FileNames(files []*drive.File) []string {
+	var fs []string
+	for _, f := range files {
+		fs = append(fs, f.Title)
+	}
+	return fs
+}
+
+func InitLog() {
+	if len(*flag_log_file) == 0 {
+		return
+	}
+	log_file, err := os.OpenFile(*flag_log_file, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+	if err != nil {
+		log.Fatalf("error opening log file: %v", err)
+	}
+	out := io.MultiWriter(os.Stdout, log_file)
+	log.SetOutput(out)
 }
 
 // Uploads a file to Google Drive
 func main() {
 	flag.Parse()
+	InitLog()
 
 	var cache oauth.Cache = oauth.CacheFile(*flag_token_cache_file)
 	token, err := cache.Token()
@@ -269,6 +383,9 @@ func main() {
 		log.Fatalf("An error occurred creating Drive client: %v\n", err)
 	}
 
+	//BenchmarkGetAllFiles(svc)
+	//return
+
 	// Google Drive filename (title)
 	var driveFileName string
 	if len(*flag_drive_file) > 0 {
@@ -288,12 +405,24 @@ func main() {
 	log.Printf("local path: %s ; folder id: %s ; drive file name: %s\n", *flag_local_file, folderId, driveFileName)
 
 	if len(*flag_local_dir) > 0 {
+		// get already existing files
+		files, err := AllFilesInDir(svc, folderId)
+		if err != nil {
+			log.Fatalf("An error occurred getting files in directory: %v\n", err)
+		}
+		fileNames := FileNames(files)
+		l := len(fileNames)
+		fmt.Println(l)
+		if l > 10 {
+			l = 10
+		}
+		fmt.Println(fileNames[:l])
+
 		re, err := regexp.Compile(".(JPG|jpg)")
 		if err != nil {
 			log.Panic("RegExp not compiling.")
 		}
-		a := []string{"poland-ball.jpg"}
-		f := CreateWalkFunc(*re, false, CreateCheckIfNotExistFunc(a, CreatePrintFunc()))
+		f := CreateWalkFunc(*re, false, CreateCheckIfNotExistFunc(fileNames, CreateUploadFunc(svc, folderId)))
 		filepath.Walk(*flag_local_dir, f)
 	}
 	//InsertFile(svc, *flag_local_file, folderId, driveFileName)
