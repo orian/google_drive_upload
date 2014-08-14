@@ -308,7 +308,7 @@ func CreatePrintFunc() filepath.WalkFunc {
 
 func CreateUploadFunc(svc *drive.Service, parentFolderId string) filepath.WalkFunc {
 	return func(path string, info os.FileInfo, err error) error {
-		log.Printf("Path to upload %s", path)
+		log.Printf("Path to upload %s, Size=%dB (%dMB)", path, info.Size(), info.Size()/1024/1024)
 		InsertFile(svc, path, parentFolderId, info.Name())
 		return nil
 	}
