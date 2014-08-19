@@ -166,7 +166,7 @@ func AllFilesInDir(d *drive.Service, parentFolderId string) ([]*drive.File, erro
 	var fs []*drive.File
 	pageToken := ""
 	for {
-		q := d.Files.List()
+		q := d.Files.List().MaxResults(1000)
 		// If we have a pageToken set, apply it to the query
 		if pageToken != "" {
 			q = q.PageToken(pageToken)
